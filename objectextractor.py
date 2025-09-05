@@ -38,7 +38,7 @@ class ObjectExtractorApp(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("PNG ObjectExtractor Pro")
+        self.setWindowTitle("PNG ObjectExtractor Pro , S. Macri 2025")
         self.setGeometry(100, 100, 1200, 800)
 
         # State
@@ -87,9 +87,16 @@ class ObjectExtractorApp(QMainWindow):
         self.slider.setValue(self.threshold_value)
         self.slider.valueChanged.connect(self.slider_changed)
 
-        # Threshold Method ComboBox
+        # Threshold Method ComboBox (mit breiter Anzeige & Tooltip)
         self.method_combo = QComboBox()
-        self.method_combo.addItems(['Manual', 'Otsu', 'Adaptive'])
+        methods = ['Manual', 'Otsu', 'Adaptive']
+        self.method_combo.addItems(methods)
+        self.method_combo.setMinimumWidth(150)
+        self.method_combo.setToolTip(
+            "Manual: Schwelle per Schieberegler einstellen\n"
+            "Otsu: Automatisch berechnet\n"
+            "Adaptive: Lokale Anpassung pro Bildbereich"
+        )
         self.method_combo.currentTextChanged.connect(self.method_changed)
 
         # Minimum Object Size SpinBox
@@ -131,7 +138,7 @@ class ObjectExtractorApp(QMainWindow):
         self.status = QStatusBar()
         self.setStatusBar(self.status)
 
-        # Export Filename Pattern (Standard wieder gesetzt)
+        # Export Filename Pattern
         self.export_name_input = QLineEdit("object_{num}.png")
         self.export_name_input.setToolTip("Dateinamen-Muster für Export, {num} wird durch Nummer ersetzt")
         export_layout.addWidget(QLabel("Export Dateiname:"))
@@ -226,14 +233,9 @@ class ObjectExtractorApp(QMainWindow):
     # ---- Bildladen & Darstellung ----
     def load_image(self, path=None):
         """Lädt ein PNG-Bild mit Alphakanal und zeigt es im Hauptfenster an."""
-        if not path:  # Button-Click → Dialog öffnen
-            path, _ = QFileDialog.getOpenFileName(
-                self,
-                "PNG Bild auswählen",
-                "",
-                "Bilder (*.png *.PNG)"
-            )
-        if not path:  # Abbrechen gedrückt
+        if path is None:
+            path, _ = QFileDialog.getOpenFileName(self, "PNG Bild auswählen", "", "PNG Bilder (*.png)")
+        if not path:
             return
 
         try:
@@ -244,14 +246,9 @@ class ObjectExtractorApp(QMainWindow):
             if img.ndim < 3 or img.shape[2] != 4:
                 raise ValueError("Das Bild hat keinen Alphakanal (kein 4-Kanal PNG).")
 
-            # BGRA → RGBA umwandeln
-            img = cv2.cvtColor(img, cv2.COLOR_BGRA2RGBA)
-
             self.original_image = img
             self.image = img.copy()
-            self.status.showMessage(
-                f"Bild geladen: {os.path.basename(path)} Größe: {img.shape[1]}x{img.shape[0]}"
-            )
+            self.status.showMessage(f"Bild geladen: {os.path.basename(path)} Größe: {img.shape[1]}x{img.shape[0]}")
 
             self.display_image(self.image)
             self.find_contours()
@@ -259,10 +256,13 @@ class ObjectExtractorApp(QMainWindow):
             QMessageBox.warning(self, "Fehler", f"Bild konnte nicht geladen werden:\n{e}")
 
     def display_image(self, img):
-        """Zeigt das RGBA-Bild im `image_label` an."""
-        height, width = img.shape[:2]
+        """Zeigt das RGBA-Bild korrekt (BGRA→RGBA) im `image_label` an."""
+        # OpenCV liefert BGRA, QImage erwartet RGBA
+        img_rgba = cv2.cvtColor(img, cv2.COLOR_BGRA2RGBA)
+        height, width = img_rgba.shape[:2]
         bytes_per_line = 4 * width
-        q_img = QImage(img.tobytes(), width, height, bytes_per_line, QImage.Format.Format_RGBA8888)
+        # .tobytes() vermeidet memoryview-Probleme; QImage macht eine Kopie
+        q_img = QImage(img_rgba.tobytes(), width, height, bytes_per_line, QImage.Format.Format_RGBA8888)
         pixmap = QPixmap.fromImage(q_img)
         self.image_label.setPixmap(pixmap)
         self.image_label._scale = 1.0
@@ -271,6 +271,9 @@ class ObjectExtractorApp(QMainWindow):
     # ---- Konturenerkennung ----
     def find_contours(self):
         """Führt Thresholding im Alphakanal durch und findet Objekte (Konturen)."""
+        if self.original_image is None:
+            return
+
         alpha = self.original_image[:, :, 3]
 
         # Thresholding
@@ -290,13 +293,17 @@ class ObjectExtractorApp(QMainWindow):
 
         if not filtered:
             self.status.showMessage("Keine Objekte gefunden - Threshold oder Bild prüfen.")
+            # Für Undo den vorherigen Zustand sichern
+            if self.contours:
+                self.undo_stack.append([c.copy() for c in self.contours])
             self.contours = []
             self.objects = []
             self.refresh_preview()
             return
 
+        # Vorherige Konturen für Undo ablegen (Kopie, damit Änderungen nicht durchschlagen)
         if self.contours:
-            self.undo_stack.append(self.contours)
+            self.undo_stack.append([c.copy() for c in self.contours])
 
         self.contours = filtered
         self.extract_objects()
@@ -305,9 +312,9 @@ class ObjectExtractorApp(QMainWindow):
     def extract_objects(self):
         """Extrahiert Objekte (ROIs) anhand der gefundenen Konturen."""
         self.objects = []
-        for idx, contour in enumerate(self.contours):
+        for contour in self.contours:
             x, y, w, h = cv2.boundingRect(contour)
-            roi = self.original_image[y:y + h, x:x + w]
+            roi = self.original_image[y:y + h, x:x + w].copy()
             mask = np.zeros((h, w), np.uint8)
 
             contour_shifted = contour - [x, y]
@@ -324,17 +331,21 @@ class ObjectExtractorApp(QMainWindow):
     # ---- Vorschau ----
     def refresh_preview(self):
         """Aktualisiert die Vorschaubilder der extrahierten Objekte."""
-        for i in reversed(range(self.canvas_layout.count())):
-            widget = self.canvas_layout.itemAt(i).widget()
-            if widget:
-                widget.setParent(None)
+        # Bestehende Widgets UND Spacer vollständig entfernen
+        while self.canvas_layout.count():
+            item = self.canvas_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
 
         scale_preview = self.preview_scaled_checkbox.isChecked()
 
         for i, obj_img in enumerate(self.objects):
-            height, width = obj_img.shape[:2]
+            # BGRA → RGBA, damit Farben korrekt sind
+            img_rgba = cv2.cvtColor(obj_img, cv2.COLOR_BGRA2RGBA)
+            height, width = img_rgba.shape[:2]
             bytes_per_line = 4 * width
-            q_img = QImage(obj_img.tobytes(), width, height, bytes_per_line, QImage.Format.Format_RGBA8888)
+            q_img = QImage(img_rgba.tobytes(), width, height, bytes_per_line, QImage.Format.Format_RGBA8888)
             pixmap = QPixmap.fromImage(q_img)
             if scale_preview:
                 pixmap = pixmap.scaledToHeight(120, Qt.TransformationMode.SmoothTransformation)
@@ -345,10 +356,11 @@ class ObjectExtractorApp(QMainWindow):
             self.canvas_layout.addWidget(lbl)
 
         self.canvas_layout.addStretch(1)
+        self.canvas.update()
 
     # ---- Undo ----
     def undo_contours(self):
-        """Setzt die Konturen zurück (Undo)."""
+        """Setzt die Konturen auf den letzten Stand zurück (Undo)."""
         if self.undo_stack:
             self.contours = self.undo_stack.pop()
             self.extract_objects()
@@ -392,19 +404,16 @@ class ObjectExtractorApp(QMainWindow):
                 print(f"Fehler beim Speichern von {path}: {e}")
 
             progress.setValue(i)
-            QApplication.processEvents()  # UI aktualisieren
             if progress.wasCanceled():
                 break
 
-        progress.close()  # Fortschrittsdialog sauber schließen
-
-        # Infofenster nach Export
         if failed:
             self.status.showMessage(f"Export abgeschlossen mit {failed} Fehlern.")
             QMessageBox.warning(self, "Export", f"Export abgeschlossen, aber {failed} Dateien konnten nicht gespeichert werden.")
         else:
             self.status.showMessage("Export abgeschlossen.")
-            QMessageBox.information(self, "Export", "Export abgeschlossen.")  # <-- bleibt offen
+            QMessageBox.information(self, "Export", "Export abgeschlossen.")
+
 
 def main():
     """Startpunkt der Anwendung."""
